@@ -7,6 +7,8 @@ description: Use when running Maven tests or verification commands and you want 
 
 Run `mvn-lt <maven args>`.
 
+While `mvn-lt` is running, do not emit intermediary commentary unless the user explicitly asked for progress updates.
+
 If `mvn-lt` is missing, link it and rerun:
 
 ```bash
