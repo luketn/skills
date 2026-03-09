@@ -74,7 +74,18 @@ def count_log_lines(log_file: Path) -> tuple[list[str], dict[str, int]]:
 
 
 def junit_report_dirs(cwd: Path) -> list[Path]:
-    return [cwd / "target" / "surefire-reports", cwd / "target" / "failsafe-reports"]
+    report_dirs = []
+    seen = set()
+    for pattern in ("**/target/surefire-reports", "**/target/failsafe-reports"):
+        for path in sorted(cwd.glob(pattern)):
+            if not path.is_dir():
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            report_dirs.append(path)
+    return report_dirs
 
 
 def parse_junit_reports(cwd: Path, run_started_at: float) -> tuple[list[dict], dict[str, int], list[Path]]:
@@ -182,7 +193,8 @@ def print_pass(totals: dict[str, int], duration: float, log_file: Path, report_f
     print(f"PASS duration={duration:.3f}s tests={totals['tests']} skipped={totals['skipped']}")
     print(f"log={log_file}")
     if report_files:
-        print("reports=" + ",".join(str(path.parent) for path in sorted(set(report_files))))
+        report_dirs = sorted({str(path.parent) for path in report_files})
+        print("reports=" + ",".join(report_dirs))
 
 
 def print_failure(
