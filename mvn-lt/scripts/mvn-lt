@@ -13,13 +13,20 @@ from pathlib import Path
 JAVA_FRAME_RE = re.compile(r"\bat (?P<frame>[\w.$]+)\((?P<file>[^:()]+\.java):(?P<line>\d+)\)")
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mvn-lt",
         description="Run Maven with low terminal output and summarize test failures."
     )
-    parser.add_argument("maven_args", nargs=argparse.REMAINDER, help="Arguments passed to mvn")
-    return parser.parse_args()
+    parser.add_argument("maven_args", nargs="*", help="Arguments passed to mvn")
+    return parser
+
+
+def parse_maven_args() -> list[str]:
+    if len(sys.argv) > 1 and sys.argv[1] in {"-h", "--help"}:
+        build_parser().print_help()
+        raise SystemExit(0)
+    return sys.argv[1:] or ["test"]
 
 
 def ensure_log_dir(cwd: Path) -> Path:
@@ -217,8 +224,7 @@ def print_failure(
 
 
 def main() -> int:
-    args = parse_args()
-    maven_args = args.maven_args or ["test"]
+    maven_args = parse_maven_args()
     cwd = Path.cwd()
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = ensure_log_dir(cwd)
