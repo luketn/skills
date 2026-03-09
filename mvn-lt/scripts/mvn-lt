@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime as dt
+import re
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+JAVA_FRAME_RE = re.compile(r"\bat (?P<frame>[\w.$]+)\((?P<file>[^:()]+\.java):(?P<line>\d+)\)")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="mvn-lt",
+        description="Run Maven with low terminal output and summarize test failures."
+    )
+    parser.add_argument("maven_args", nargs=argparse.REMAINDER, help="Arguments passed to mvn")
+    return parser.parse_args()
+
+
+def ensure_log_dir(cwd: Path) -> Path:
+    target_dir = cwd / "target" / "codex-logs"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir
+
+
+def run_maven(cwd: Path, maven_args: list[str], log_file: Path) -> tuple[int, float, float]:
+    command = ["mvn", *maven_args]
+    start = time.time()
+    with log_file.open("w", encoding="utf-8") as handle:
+        handle.write(f"$ {' '.join(command)}\n")
+        handle.flush()
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            handle.write(line)
+        process.wait()
+    duration = time.time() - start
+    return process.returncode, duration, start
+
+
+def normalize_log_line(line: str) -> str:
+    return " ".join(line.strip().split())
+
+
+def count_log_lines(log_file: Path) -> tuple[list[str], dict[str, int]]:
+    lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    first_match_line = {}
+    for idx, line in enumerate(lines, start=1):
+        normalized = normalize_log_line(line)
+        if normalized not in first_match_line:
+            first_match_line[normalized] = idx
+    return lines, first_match_line
+
+
+def junit_report_dirs(cwd: Path) -> list[Path]:
+    return [cwd / "target" / "surefire-reports", cwd / "target" / "failsafe-reports"]
+
+
+def parse_junit_reports(cwd: Path, run_started_at: float) -> tuple[list[dict], dict[str, int], list[Path]]:
+    failures = []
+    totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    report_files = []
+    for report_dir in junit_report_dirs(cwd):
+        if not report_dir.exists():
+            continue
+        for xml_path in sorted(report_dir.glob("TEST-*.xml")):
+            if xml_path.stat().st_mtime < run_started_at - 1:
+                continue
+            report_files.append(xml_path)
+            try:
+                root = ET.parse(xml_path).getroot()
+            except ET.ParseError:
+                continue
+            totals["tests"] += int(root.attrib.get("tests", "0"))
+            totals["failures"] += int(root.attrib.get("failures", "0"))
+            totals["errors"] += int(root.attrib.get("errors", "0"))
+            totals["skipped"] += int(root.attrib.get("skipped", "0"))
+            for testcase in root.findall("testcase"):
+                failure = testcase.find("failure")
+                error = testcase.find("error")
+                if failure is None and error is None:
+                    continue
+                node = failure if failure is not None else error
+                system_out = testcase.findtext("system-out") or ""
+                system_err = testcase.findtext("system-err") or ""
+                failures.append(
+                    {
+                        "report_file": xml_path,
+                        "classname": testcase.attrib.get("classname", root.attrib.get("name", "")),
+                        "name": testcase.attrib.get("name", ""),
+                        "message": node.attrib.get("message", "").strip(),
+                        "details": (node.text or "").strip(),
+                        "system_out": system_out.strip().splitlines(),
+                        "system_err": system_err.strip().splitlines(),
+                    }
+                )
+    return failures, totals, report_files
+
+
+def first_project_frame(details: str) -> str | None:
+    for line in details.splitlines():
+        match = JAVA_FRAME_RE.search(line)
+        if not match:
+            continue
+        frame = match.group("frame")
+        if frame.startswith("com."):
+            return f"{match.group('file')}:{match.group('line')}"
+    return None
+
+
+def relevant_log_lines(log_lines: list[str]) -> list[tuple[int, str]]:
+    patterns = [
+        "BUILD FAILURE",
+        "BUILD SUCCESS",
+        "Failed to execute goal",
+        "COMPILATION ERROR",
+        "There are test failures",
+        "[ERROR] Failures:",
+        "[ERROR] Errors:",
+        "[ERROR]   ",
+        "[INFO] Results:",
+    ]
+    selected = []
+    for idx, line in enumerate(log_lines, start=1):
+        if any(pattern in line for pattern in patterns):
+            selected.append((idx, line))
+    if selected:
+        return selected[:20]
+    tail_start = max(1, len(log_lines) - 20)
+    return [(idx, log_lines[idx - 1]) for idx in range(tail_start, len(log_lines) + 1)]
+
+
+def map_lines_to_log(lines: list[str], line_lookup: dict[str, int]) -> list[tuple[int | None, str]]:
+    mapped = []
+    for line in lines:
+        clean = line.rstrip()
+        mapped.append((line_lookup.get(normalize_log_line(clean)), clean))
+    return mapped
+
+
+def interesting_case_lines(lines: list[str]) -> list[str]:
+    if not lines:
+        return []
+    prioritized = []
+    fallback = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(token in stripped for token in ("RequestLog", "AccessLog", " WARN ", " ERROR ", "Exception", "Assertion")):
+            prioritized.append(stripped)
+        elif stripped[:4].isdigit() and "T" in stripped:
+            prioritized.append(stripped)
+        else:
+            fallback.append(stripped)
+    selected = prioritized if prioritized else fallback
+    return selected[-8:]
+
+
+def print_pass(totals: dict[str, int], duration: float, log_file: Path, report_files: list[Path]) -> None:
+    print(f"PASS duration={duration:.3f}s tests={totals['tests']} skipped={totals['skipped']}")
+    print(f"log={log_file}")
+    if report_files:
+        print("reports=" + ",".join(str(path.parent) for path in sorted(set(report_files))))
+
+
+def print_failure(
+    failures: list[dict],
+    totals: dict[str, int],
+    duration: float,
+    log_file: Path,
+    log_lines: list[str],
+    line_lookup: dict[str, int],
+) -> None:
+    print(
+        "FAIL"
+        f" duration={duration:.3f}s tests={totals['tests']} failures={totals['failures']}"
+        f" errors={totals['errors']} skipped={totals['skipped']}"
+    )
+    print(f"log={log_file}")
+    if failures:
+        for failure in failures[:5]:
+            test_id = f"{failure['classname']}.{failure['name']}"
+            print(f"test={test_id}")
+            print(f"report={failure['report_file']}")
+            if failure["message"]:
+                print(f"message={failure['message']}")
+            frame = first_project_frame(failure["details"])
+            if frame is not None:
+                print(f"source={frame}")
+            for idx, line in enumerate(failure["details"].splitlines()[:8], start=1):
+                print(f"stack[{idx}]={line}")
+            mapped = map_lines_to_log(interesting_case_lines(failure["system_out"]), line_lookup)
+            for idx, (line_no, line) in enumerate(mapped, start=1):
+                prefix = f"log_line[{idx}]={line_no}" if line_no is not None else f"log_line[{idx}]=?"
+                print(f"{prefix} {line}")
+            if failure["system_err"]:
+                for idx, line in enumerate(failure["system_err"][:4], start=1):
+                    print(f"stderr[{idx}]={line}")
+    else:
+        for line_no, line in relevant_log_lines(log_lines):
+            print(f"log_line={line_no} {line}")
+
+
+def main() -> int:
+    args = parse_args()
+    maven_args = args.maven_args or ["test"]
+    cwd = Path.cwd()
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = ensure_log_dir(cwd)
+    log_file = log_dir / f"maven-{timestamp}.log"
+
+    exit_code, duration, run_started_at = run_maven(cwd, maven_args, log_file)
+    log_lines, line_lookup = count_log_lines(log_file)
+    failures, totals, report_files = parse_junit_reports(cwd, run_started_at)
+
+    if exit_code == 0 and totals["failures"] == 0 and totals["errors"] == 0:
+        print_pass(totals, duration, log_file, report_files)
+        return 0
+
+    print_failure(failures, totals, duration, log_file, log_lines, line_lookup)
+    return exit_code or 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
